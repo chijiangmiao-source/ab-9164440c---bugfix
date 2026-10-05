@@ -141,6 +141,9 @@ def main() -> int:
     if lateness_ms >= 70_000:
         print(f"[FAIL] allowed lateness {lateness_ms}ms too large for smoke scenario")
         return 1
+    # baseline counters (the smoke script may run more than once on a volume)
+    readings_before = int(state.get("reading_count", 0))
+    rejected_before = int(state.get("rejected_reading_count", 0))
 
     run = f"{int(time.time())}-{os.getpid()}"
     eid = lambda name: f"smoke-{run}-{name}"  # noqa: E731
@@ -220,6 +223,61 @@ def main() -> int:
         "rejected late reading leaves the published summary untouched",
     )
 
+    # -- 2b. a rejected late packet must not stall the probe ---------------
+    # The rejected seq (alpha_seq + 3) is disposed of as a tombstone, not an
+    # unfilled gap: subsequent valid readings must still advance alpha's
+    # contiguous prefix and the global watermark.
+    status, _, _ = req(
+        "POST", "/readings", reading(eid("a5"), "alpha", alpha_seq + 4, 700, 4.0)
+    )
+    check(status == 200, "valid reading after the rejected one is accepted")
+    status, _, ack = req(
+        "POST", "/readings", reading(eid("b3"), "beta", beta_seq + 2, 700, 6.0)
+    )
+    recovered_wm = iso(base_ms + 700_000 - lateness_ms)
+    check(
+        status == 200
+        and ack.get("watermark") == recovered_wm
+        and ack.get("probe_progress", {}).get("alpha", {}).get("contiguous_seq")
+        == alpha_seq + 4
+        and ack.get("probe_progress", {}).get("alpha", {}).get("frontier_time")
+        == iso(base_ms + 700_000),
+        "alpha progress and the watermark recover after a sealed-window rejection",
+        context=f"got {ack.get('watermark')} {ack.get('probe_progress')}",
+    )
+    status, _, state = req("GET", "/state")
+    check(
+        status == 200
+        and state.get("probes", {}).get("alpha", {}).get("contiguous_seq")
+        == alpha_seq + 4
+        and state.get("probes", {}).get("alpha", {}).get("max_seq") == alpha_seq + 4
+        and state.get("reading_count") == readings_before + 7
+        and state.get("rejected_reading_count", 0) == rejected_before + 1,
+        "rejected packet is counted as a disposition, never as a reading",
+        context=f"got {state.get('probes')} readings={state.get('reading_count')}",
+    )
+    # rejection semantics stay stable for the disposed packet
+    status, _, body = req("POST", "/readings", late)
+    check(
+        status == 409 and body.get("error") == "window_sealed",
+        "replay of the rejected packet is still a window_sealed 409",
+        context=f"got {status} {body}",
+    )
+    status, _, body = req("POST", "/readings", dict(late, dose=99.0))
+    check(
+        status == 409 and body.get("error") == "event_conflict",
+        "same event id with different content is an event_conflict after rejection",
+        context=f"got {status} {body}",
+    )
+    status, _, body = req(
+        "POST", "/readings", dict(late, event_id=eid("a4-seq-steal"))
+    )
+    check(
+        status == 409 and body.get("error") == "seq_conflict",
+        "reusing the rejected seq with another event id is a seq_conflict",
+        context=f"got {status} {body}",
+    )
+
     # -- 3. recovery --------------------------------------------------------
     saved_window = window_after
     saved_ack = ack1
@@ -249,11 +307,30 @@ def main() -> int:
             "sealed window still rejects late data after restart",
         )
         status, _, state = req("GET", "/state")
-        expected_wm = iso(base_ms + 370_000 - lateness_ms)
         check(
-            status == 200 and state.get("watermark") == expected_wm,
+            status == 200 and state.get("watermark") == recovered_wm,
             "watermark recovered from persistent state",
-            context=f"got {state.get('watermark')}, want {expected_wm}",
+            context=f"got {state.get('watermark')}, want {recovered_wm}",
+        )
+        # the rejected seq is still recognized as disposed after restart,
+        # so alpha's recovered contiguous prefix persists as well
+        check(
+            status == 200
+            and state.get("probes", {}).get("alpha", {}).get("contiguous_seq")
+            == alpha_seq + 4
+            and state.get("rejected_reading_count", 0) == rejected_before + 1,
+            "disposed rejection and alpha progress survive restart",
+            context=f"got {state.get('probes')}",
+        )
+        status, _, ack = req(
+            "POST", "/readings", reading(eid("a6"), "alpha", alpha_seq + 5, 710, 1.0)
+        )
+        check(
+            status == 200
+            and ack.get("probe_progress", {}).get("alpha", {}).get("contiguous_seq")
+            == alpha_seq + 5,
+            "alpha keeps advancing after restart",
+            context=f"got {ack.get('probe_progress')}",
         )
 
     print(f"[smoke] passed={CHECKS['passed']} failed={CHECKS['failed']}")

@@ -16,7 +16,15 @@ Invariants enforced here:
   the reading that made it sealable.  ``window_start_ms`` is the primary
   key, so concurrent submissions and restarts leave exactly one record.
 * Immutability — a reading whose observation falls into an already
-  sealed window is rejected and changes nothing.
+  sealed window is rejected, contributes no dose, and never raises the
+  probe frontier.  It is nevertheless recorded as a *tombstone*
+  (``rejected_readings``): the sequence number is disposed of rather
+  than left looking like an unfilled gap, so later valid readings (and
+  a restart) can still extend the contiguous prefix and the watermark.
+  Tombstones preserve idempotency/conflict semantics: the identical
+  packet replays the same 409, the same ``event_id`` with different
+  content is an ``event_conflict``, and reuse of the ``(probe, seq)``
+  pair is a ``seq_conflict``.
 """
 from __future__ import annotations
 
@@ -85,6 +93,12 @@ class Engine:
         Raises :class:`BadRequestError` for an unknown probe and
         :class:`ConflictError` for event conflicts, sequence reuse, or
         data landing in an already sealed window.
+
+        A ``window_sealed`` rejection is itself persisted as a tombstone
+        (in the same transaction) *before* the 409 is raised, so the
+        rejected sequence is durably disposed of: it neither aggregates
+        dose nor advances the frontier, yet it no longer looks like an
+        unfilled gap to later readings.
         """
         s = self.settings
         if reading.probe not in s.probes:
@@ -96,6 +110,10 @@ class Engine:
         content_hash = _content_hash(reading, observed_ms)
         window_start = (observed_ms // s.window_ms) * s.window_ms
         now_ms = round(time.time() * 1000)
+
+        # Raised only after the write transaction commits (a persisted
+        # rejection must survive the 409 it answers with).
+        pending: ConflictError | None = None
 
         with self.storage.write_txn() as conn:
             row = conn.execute(
@@ -124,81 +142,168 @@ class Engine:
                     },
                 )
 
-            seq_owner = conn.execute(
-                "SELECT event_id FROM readings WHERE probe = ? AND seq = ?",
-                (reading.probe, reading.seq),
+            # A previously rejected packet is also a known identity: its
+            # tombstone preserves the idempotency/conflict contract across
+            # retransmission and restarts.
+            tomb = conn.execute(
+                "SELECT * FROM rejected_readings WHERE event_id = ?", (reading.event_id,)
             ).fetchone()
-            if seq_owner is not None:
-                raise ConflictError(
-                    "seq_conflict",
-                    f"probe {reading.probe!r} seq {reading.seq} is already bound to "
-                    f"event {seq_owner['event_id']!r}",
+            if tomb is not None:
+                if tomb["content_hash"] != content_hash:
+                    raise ConflictError(
+                        "event_conflict",
+                        f"event_id {reading.event_id!r} already exists with different content",
+                        detail={
+                            "stored": {
+                                "probe": tomb["probe"],
+                                "seq": tomb["seq"],
+                                "observed_at": iso(tomb["observed_at_ms"]),
+                                "dose": tomb["dose"],
+                            },
+                            "received": {
+                                "probe": reading.probe,
+                                "seq": reading.seq,
+                                "observed_at": iso(observed_ms),
+                                "dose": reading.dose,
+                            },
+                        },
+                    )
+                # Identical replay of a rejected packet: the same 409,
+                # verbatim, every time.
+                pending = self._sealed_window_error(
+                    s,
+                    tomb["window_start_ms"],
+                    tomb["reason"],
+                    tomb["watermark_ms"],
                 )
+            else:
+                seq_owner = conn.execute(
+                    "SELECT event_id FROM readings WHERE probe = ? AND seq = ?"
+                    " UNION ALL"
+                    " SELECT event_id FROM rejected_readings WHERE probe = ? AND seq = ?",
+                    (reading.probe, reading.seq, reading.probe, reading.seq),
+                ).fetchone()
+                if seq_owner is not None:
+                    raise ConflictError(
+                        "seq_conflict",
+                        f"probe {reading.probe!r} seq {reading.seq} is already bound to "
+                        f"event {seq_owner['event_id']!r}",
+                    )
 
-            sealed = conn.execute(
-                "SELECT 1 FROM windows WHERE window_start_ms = ?", (window_start,)
-            ).fetchone()
-            if sealed is not None:
-                raise ConflictError(
-                    "window_sealed",
-                    f"window starting {iso(window_start)} is already sealed; "
-                    "late reading rejected without altering the published summary",
-                    detail={"window_start": iso(window_start), "reason": "sealed"},
-                )
-            # Watermark gate: a window whose end is at or before the current
-            # watermark is closed even if no physical record exists for it
-            # (e.g. it predates the first observed event).  Late packets can
-            # never create or rewrite a published risk level.
-            current_wm = self._watermark(conn)
-            if current_wm is not None and window_start + s.window_ms <= current_wm:
-                raise ConflictError(
-                    "window_sealed",
-                    f"window starting {iso(window_start)} ended at "
-                    f"{iso(window_start + s.window_ms)}, at or before the current "
-                    f"watermark {iso(current_wm)}; late reading rejected",
-                    detail={
+                reason = None
+                sealed = conn.execute(
+                    "SELECT 1 FROM windows WHERE window_start_ms = ?", (window_start,)
+                ).fetchone()
+                if sealed is not None:
+                    reason = "sealed"
+                    watermark_at_rejection = None
+                else:
+                    # Watermark gate: a window whose end is at or before the current
+                    # watermark is closed even if no physical record exists for it
+                    # (e.g. it predates the first observed event).  Late packets can
+                    # never create or rewrite a published risk level.
+                    current_wm = self._watermark(conn)
+                    if current_wm is not None and window_start + s.window_ms <= current_wm:
+                        reason = "past_watermark"
+                        watermark_at_rejection = current_wm
+
+                if reason is not None:
+                    # Persist the disposition so this seq can never masquerade
+                    # as an unfilled gap, then update progress in the same
+                    # transaction.  No dose is stored and the frontier never
+                    # rises, so no window seals and no summary changes.
+                    conn.execute(
+                        "INSERT INTO rejected_readings (event_id, probe, seq,"
+                        " observed_at_ms, dose, content_hash, reason,"
+                        " window_start_ms, watermark_ms, received_at_ms)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            reading.event_id,
+                            reading.probe,
+                            reading.seq,
+                            observed_ms,
+                            reading.dose,
+                            content_hash,
+                            reason,
+                            window_start,
+                            watermark_at_rejection,
+                            now_ms,
+                        ),
+                    )
+                    self._advance_probe(conn, reading.probe, reading.seq, observed_ms, now_ms)
+                    # The tombstone supplies no time itself, but it can close a
+                    # gap and thereby reach accepted readings buffered beyond
+                    # it, which may honestly raise the watermark; seal any
+                    # windows that became sealable, in this same transaction.
+                    self._seal_windows(conn, self._watermark(conn), now_ms)
+                    pending = self._sealed_window_error(
+                        s, window_start, reason, watermark_at_rejection
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO readings (event_id, probe, seq, observed_at_ms, dose,"
+                        " content_hash, ack_json, received_at_ms) VALUES (?,?,?,?,?,?,?,?)",
+                        (
+                            reading.event_id,
+                            reading.probe,
+                            reading.seq,
+                            observed_ms,
+                            reading.dose,
+                            content_hash,
+                            "{}",
+                            now_ms,
+                        ),
+                    )
+
+                    self._advance_probe(conn, reading.probe, reading.seq, observed_ms, now_ms)
+                    watermark_ms = self._watermark(conn)
+                    sealed_summaries = self._seal_windows(conn, watermark_ms, now_ms)
+                    ack = {
+                        "event_id": reading.event_id,
+                        "probe": reading.probe,
+                        "seq": reading.seq,
+                        "status": "accepted",
                         "window_start": iso(window_start),
-                        "watermark": iso(current_wm),
-                        "reason": "past_watermark",
-                    },
-                )
+                        "window_end": iso(window_start + s.window_ms),
+                        "watermark": iso(watermark_ms),
+                        "sealed_windows": sealed_summaries,
+                        "probe_progress": self._progress(conn),
+                    }
+                    # Persist the ack so identical retransmissions replay it exactly,
+                    # even after a process restart.
+                    conn.execute(
+                        "UPDATE readings SET ack_json = ? WHERE event_id = ?",
+                        (json.dumps(ack, sort_keys=True), reading.event_id),
+                    )
 
-            conn.execute(
-                "INSERT INTO readings (event_id, probe, seq, observed_at_ms, dose,"
-                " content_hash, ack_json, received_at_ms) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    reading.event_id,
-                    reading.probe,
-                    reading.seq,
-                    observed_ms,
-                    reading.dose,
-                    content_hash,
-                    "{}",
-                    now_ms,
-                ),
+        # The tombstone (and any progress bookkeeping) committed with the
+        # transaction; only now do we answer with the rejection.
+        if pending is not None:
+            raise pending
+        return ack, False
+
+    @staticmethod
+    def _sealed_window_error(
+        s: Settings, window_start: int, reason: str, watermark_ms: int | None
+    ) -> ConflictError:
+        if reason == "sealed":
+            return ConflictError(
+                "window_sealed",
+                f"window starting {iso(window_start)} is already sealed; "
+                "late reading rejected without altering the published summary",
+                detail={"window_start": iso(window_start), "reason": "sealed"},
             )
-
-            self._advance_probe(conn, reading.probe, reading.seq, observed_ms, now_ms)
-            watermark_ms = self._watermark(conn)
-            sealed_summaries = self._seal_windows(conn, watermark_ms, now_ms)
-            ack = {
-                "event_id": reading.event_id,
-                "probe": reading.probe,
-                "seq": reading.seq,
-                "status": "accepted",
+        return ConflictError(
+            "window_sealed",
+            f"window starting {iso(window_start)} ended at "
+            f"{iso(window_start + s.window_ms)}, at or before the current "
+            f"watermark {iso(watermark_ms)}; late reading rejected",
+            detail={
                 "window_start": iso(window_start),
-                "window_end": iso(window_start + s.window_ms),
                 "watermark": iso(watermark_ms),
-                "sealed_windows": sealed_summaries,
-                "probe_progress": self._progress(conn),
-            }
-            # Persist the ack so identical retransmissions replay it exactly,
-            # even after a process restart.
-            conn.execute(
-                "UPDATE readings SET ack_json = ? WHERE event_id = ?",
-                (json.dumps(ack, sort_keys=True), reading.event_id),
-            )
-            return ack, False
+                "reason": "past_watermark",
+            },
+        )
 
     def _advance_probe(self, conn, probe: str, seq: int, observed_ms: int, now_ms: int) -> None:
         row = conn.execute(
@@ -220,21 +325,29 @@ class Engine:
 
         max_seq = max(max_seq, seq)
         if seq > contiguous:
-            # Extend the contiguous prefix as far as buffered readings allow.
-            # A gap simply leaves the frontier where it was: no fabricated
+            # Extend the contiguous prefix as far as disposed readings allow.
+            # An accepted reading supplies its observation time; a rejected
+            # reading (tombstone) fills the sequence position but supplies no
+            # time, so the frontier/watermark never move because of it.  A
+            # genuinely missing seq still halts the walk: no fabricated
             # progress from out-of-order or missing sequence numbers.
             cur = contiguous
             while True:
                 nxt = conn.execute(
-                    "SELECT observed_at_ms FROM readings WHERE probe = ? AND seq = ?",
-                    (probe, cur + 1),
+                    "SELECT observed_at_ms, 0 AS is_rejected FROM readings"
+                    " WHERE probe = ? AND seq = ?"
+                    " UNION ALL"
+                    " SELECT observed_at_ms, 1 AS is_rejected FROM rejected_readings"
+                    " WHERE probe = ? AND seq = ?",
+                    (probe, cur + 1, probe, cur + 1),
                 ).fetchone()
                 if nxt is None:
                     break
                 cur += 1
-                frontier = nxt["observed_at_ms"] if frontier is None else max(
-                    frontier, nxt["observed_at_ms"]
-                )
+                if not nxt["is_rejected"]:
+                    frontier = nxt["observed_at_ms"] if frontier is None else max(
+                        frontier, nxt["observed_at_ms"]
+                    )
             contiguous = cur
 
         conn.execute(
@@ -466,12 +579,16 @@ class Engine:
             progress = self._progress(conn)
             sealed = conn.execute("SELECT COUNT(*) AS c FROM windows").fetchone()["c"]
             readings = conn.execute("SELECT COUNT(*) AS c FROM readings").fetchone()["c"]
+            rejected = conn.execute(
+                "SELECT COUNT(*) AS c FROM rejected_readings"
+            ).fetchone()["c"]
         s = self.settings
         return {
             "watermark": iso(watermark_ms),
             "probes": progress,
             "sealed_window_count": sealed,
             "reading_count": readings,
+            "rejected_reading_count": rejected,
             "config": {
                 "window_seconds": s.window_seconds,
                 "allowed_lateness_seconds": s.allowed_lateness_seconds,

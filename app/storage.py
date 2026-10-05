@@ -4,8 +4,10 @@ A single connection guarded by a re-entrant lock serializes all access;
 every ingest + watermark advance + window sealing happens inside one
 ``BEGIN IMMEDIATE`` transaction, so a sealed record is either fully
 committed or not at all — even under concurrent submissions or a crash.
-State lives entirely in the database file, so a process restart resumes
-from exactly what was committed.
+Readings rejected as 409 ``window_sealed`` are likewise committed (as
+tombstones in ``rejected_readings``) in that transaction.  State lives
+entirely in the database file, so a process restart resumes from exactly
+what was committed.
 """
 from __future__ import annotations
 
@@ -48,6 +50,25 @@ CREATE TABLE IF NOT EXISTS windows (
     watermark_ms         INTEGER NOT NULL,
     progress_json        TEXT NOT NULL,
     sealed_at_ms         INTEGER NOT NULL
+);
+
+-- Readings rejected as 409 window_sealed are kept as "tombstones": the
+-- packet was seen and disposed of, so its (probe, seq) must not masquerade
+-- as a never-filled gap that stalls the contiguous sequence prefix after
+-- later (and restarted) processing.  Tombstones are deliberately excluded
+-- from every dose aggregation; they also never raise the probe frontier.
+CREATE TABLE IF NOT EXISTS rejected_readings (
+    event_id        TEXT PRIMARY KEY,
+    probe           TEXT NOT NULL,
+    seq             INTEGER NOT NULL,
+    observed_at_ms  INTEGER NOT NULL,
+    dose            REAL NOT NULL,
+    content_hash    TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    window_start_ms INTEGER NOT NULL,
+    watermark_ms    INTEGER,
+    received_at_ms  INTEGER NOT NULL,
+    UNIQUE (probe, seq)
 );
 """
 

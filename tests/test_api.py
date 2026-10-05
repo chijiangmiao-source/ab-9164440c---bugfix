@@ -161,7 +161,98 @@ def test_sealed_window_rejects_late_data_without_changing_summary(client):
     w = client.get(f"/windows/{ts(0)}").json()
     assert w["total_dose"] == 30.0
     assert w["event_count"] == 2
-    assert client.get("/state").json()["reading_count"] == 4  # nothing persisted
+    assert client.get("/state").json()["reading_count"] == 4  # nothing aggregated
+
+
+def test_rejected_late_reading_does_not_permanently_block_probe(client):
+    # Reported regression: after the first window seals, a late reading for
+    # that window is rejected — but its sequence must be recorded as disposed
+    # so later valid readings of the same probe keep advancing the contiguous
+    # prefix and the global watermark.
+    assert client.post("/readings", json=reading("a1", "alpha", 1, 290, 10.0)).status_code == 200
+    assert client.post("/readings", json=reading("b1", "beta", 1, 100, 20.0)).status_code == 200
+    assert client.post("/readings", json=reading("a2", "alpha", 2, 320, 5.0)).status_code == 200
+    assert client.post("/readings", json=reading("b2", "beta", 2, 305, 7.0)).status_code == 200
+
+    # late reading for the now-sealed first window: rejected, persisted as
+    # a disposition only
+    r = client.post("/readings", json=reading("a3", "alpha", 3, 200, 50.0))
+    assert r.status_code == 409
+    assert r.json()["error"] == "window_sealed"
+
+    # later valid readings resume alpha's contiguous progress instead of
+    # stalling forever at seq 2
+    assert client.post("/readings", json=reading("a4", "alpha", 4, 1000, 1.0)).status_code == 200
+    assert client.post("/readings", json=reading("a5", "alpha", 5, 1000, 2.0)).status_code == 200
+    assert client.post("/readings", json=reading("b3", "beta", 3, 1000, 3.0)).status_code == 200
+    r = client.post("/readings", json=reading("b4", "beta", 4, 1000, 4.0))
+    assert r.status_code == 200
+
+    st = client.get("/state").json()
+    assert st["probes"]["alpha"]["contiguous_seq"] == 5
+    assert st["probes"]["alpha"]["max_seq"] == 5
+    assert st["probes"]["alpha"]["frontier_time"] == ts(1000)
+    assert st["probes"]["beta"]["contiguous_seq"] == 4
+    assert st["watermark"] == ts(1000)
+    assert st["reading_count"] == 8  # the rejected packet never aggregates
+    assert st["rejected_reading_count"] == 1
+
+    # the rejected packet's dose/peak must not appear in the sealed summary
+    w = client.get(f"/windows/{ts(0)}").json()
+    assert w["status"] == "sealed"
+    assert w["total_dose"] == 30.0
+    assert w["peak_dose"] == 20.0
+    assert w["event_count"] == 2
+    assert {e["event_id"] for e in w["events"]} == {"a1", "b1"}
+
+    # a window advanced into by the recovered progress seals normally
+    assert client.get(f"/windows/{ts(300)}").json()["status"] == "sealed"
+
+    # the rejected packet keeps its idempotency/conflict semantics
+    r = client.post("/readings", json=reading("a3", "alpha", 3, 200, 50.0))
+    assert r.status_code == 409 and r.json()["error"] == "window_sealed"
+    r = client.post("/readings", json=reading("a3", "alpha", 3, 200, 99.0))
+    assert r.status_code == 409 and r.json()["error"] == "event_conflict"
+    r = client.post("/readings", json=reading("a3x", "alpha", 3, 200, 50.0))
+    assert r.status_code == 409 and r.json()["error"] == "seq_conflict"
+
+
+def test_rejected_reading_disposition_survives_restart(db_path):
+    # Same scenario across a process restart: the disposition must be
+    # recognized afterwards and the probe must already be unblocked.
+    with TestClient(create_app(make_settings(db_path))) as c1:
+        c1.post("/readings", json=reading("a1", "alpha", 1, 290, 10.0))
+        c1.post("/readings", json=reading("b1", "beta", 1, 100, 20.0))
+        c1.post("/readings", json=reading("a2", "alpha", 2, 320, 5.0))
+        c1.post("/readings", json=reading("b2", "beta", 2, 305, 7.0))
+        assert c1.post("/readings", json=reading("a3", "alpha", 3, 200, 50.0)).status_code == 409
+        c1.post("/readings", json=reading("a4", "alpha", 4, 1000, 1.0))
+        c1.post("/readings", json=reading("a5", "alpha", 5, 1000, 2.0))
+        c1.post("/readings", json=reading("b3", "beta", 3, 1000, 3.0))
+        c1.post("/readings", json=reading("b4", "beta", 4, 1000, 4.0))
+
+    with TestClient(create_app(make_settings(db_path))) as c2:
+        st = c2.get("/state").json()
+        assert st["probes"]["alpha"]["contiguous_seq"] == 5
+        assert st["probes"]["alpha"]["frontier_time"] == ts(1000)
+        assert st["watermark"] == ts(1000)
+        assert st["rejected_reading_count"] == 1
+
+        # still rejected with the same semantics after restart
+        r = c2.post("/readings", json=reading("a3", "alpha", 3, 200, 50.0))
+        assert r.status_code == 409 and r.json()["error"] == "window_sealed"
+        r = c2.post("/readings", json=reading("a3", "alpha", 3, 200, 99.0))
+        assert r.status_code == 409 and r.json()["error"] == "event_conflict"
+        r = c2.post("/readings", json=reading("a3x", "alpha", 3, 200, 50.0))
+        assert r.status_code == 409 and r.json()["error"] == "seq_conflict"
+
+        w = c2.get(f"/windows/{ts(0)}").json()
+        assert w["total_dose"] == 30.0 and w["event_count"] == 2
+
+        # and progress continues beyond the already-seen prefix
+        r = c2.post("/readings", json=reading("a6", "alpha", 6, 1400, 1.0))
+        assert r.status_code == 200
+        assert c2.get("/state").json()["probes"]["alpha"]["contiguous_seq"] == 6
 
 
 def test_open_window_is_provisional(client):
@@ -359,9 +450,27 @@ def test_restart_recovers_sealed_windows_and_idempotency(db_path):
         assert r.json()["error"] == "window_sealed"
         assert c2.get(f"/windows/{ts(0)}").json() == sealed_before
 
-        # and new data keeps flowing after the restart
-        r = c2.post("/readings", json=reading("a3", "alpha", 3, 500, 4.0))
+        # the rejected packet is a disposed identity/sequence after the
+        # restart: its idempotency and conflict semantics are preserved
+        r = c2.post("/readings", json=reading("a3", "alpha", 3, 200, 50.0))
+        assert r.status_code == 409
+        assert r.json()["error"] == "window_sealed"
+        r = c2.post("/readings", json=reading("a3", "alpha", 3, 200, 51.0))
+        assert r.status_code == 409
+        assert r.json()["error"] == "event_conflict"
+        r = c2.post("/readings", json=reading("a3-other", "alpha", 3, 200, 50.0))
+        assert r.status_code == 409
+        assert r.json()["error"] == "seq_conflict"
+
+        # and new data keeps flowing after the restart, past the disposed
+        # seq=3 (its tombstone no longer poses as an unfilled gap)
+        r = c2.post("/readings", json=reading("a4", "alpha", 4, 500, 4.0))
         assert r.status_code == 200
+        st = c2.get("/state").json()
+        assert st["probes"]["alpha"]["contiguous_seq"] == 4
+        assert st["probes"]["alpha"]["frontier_time"] == ts(500)
+        assert st["probes"]["alpha"]["max_seq"] == 4
+        assert st["rejected_reading_count"] == 1
 
 
 # --------------------------------------------------------------- concurrency
