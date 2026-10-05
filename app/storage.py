@@ -25,6 +25,10 @@ CREATE TABLE IF NOT EXISTS readings (
     content_hash    TEXT NOT NULL,
     ack_json        TEXT NOT NULL,
     received_at_ms  INTEGER NOT NULL,
+    -- 'accepted' readings feed dose aggregation and the observed frontier;
+    -- 'disposed' rows are sealed-window rejections kept so the seq stays
+    -- handled (idempotency/conflicts) without blocking probe progress.
+    status          TEXT NOT NULL DEFAULT 'accepted',
     UNIQUE (probe, seq)
 );
 CREATE INDEX IF NOT EXISTS idx_readings_window ON readings (observed_at_ms);
@@ -67,6 +71,17 @@ class Storage:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Bring databases created by older versions up to the current schema."""
+        columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(readings)")
+        }
+        if "status" not in columns:
+            self._conn.execute(
+                "ALTER TABLE readings ADD COLUMN status TEXT NOT NULL DEFAULT 'accepted'"
+            )
 
     @contextmanager
     def write_txn(self) -> Iterator[sqlite3.Connection]:

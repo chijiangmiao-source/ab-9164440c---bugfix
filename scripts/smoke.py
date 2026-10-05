@@ -6,7 +6,8 @@ Covers the three acceptance themes against the live service:
    conflicting content is rejected with 409.
 2. Out-of-order sealing — out-of-order readings merge into the correct
    five-minute window, which seals exactly once the watermark passes its
-   end; late data for the sealed window is rejected without effect.
+   end; late data for the sealed window is rejected without effect, and
+   the rejection does not block the probe's later progress.
 3. Recovery — the app container is restarted through the Docker socket;
    sealed windows, idempotency records, and rejections must survive.
 
@@ -23,6 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 BASE_URL = os.environ.get("APP_BASE_URL", "http://app:8000").rstrip("/")
 DOCKER_SOCKET = os.environ.get("DOCKER_SOCKET", "/var/run/docker.sock")
@@ -147,6 +149,14 @@ def main() -> int:
     alpha_seq = state["probes"]["alpha"]["max_seq"] + 1
     beta_seq = state["probes"]["beta"]["max_seq"] + 1
     base_ms = (int(time.time() * 1000) // window_ms) * window_ms
+    # On a reused volume, anchor the scenario beyond the watermark left by
+    # a previous run so its windows are still open.
+    prev_wm = state.get("watermark")
+    if prev_wm:
+        wm_ms = round(
+            datetime.fromisoformat(prev_wm.replace("Z", "+00:00")).timestamp() * 1000
+        )
+        base_ms = max(base_ms, (wm_ms // window_ms) * window_ms + window_ms)
     t = lambda offset_s: iso(base_ms + offset_s * 1000)  # noqa: E731
 
     def reading(event_id, probe, seq, offset_s, dose):
@@ -220,6 +230,49 @@ def main() -> int:
         "rejected late reading leaves the published summary untouched",
     )
 
+    # -- 2b. the rejection does not block the probe's later progress --------
+    status, _, replay = req("POST", "/readings", late)
+    check(
+        status == 409 and replay == body,
+        "identical retransmission of the rejected reading replays the same 409",
+        context=f"got {status} {replay}",
+    )
+
+    accepted = True
+    for follow in (
+        reading(eid("a5"), "alpha", alpha_seq + 4, 1000, 1.0),
+        reading(eid("a6"), "alpha", alpha_seq + 5, 1000, 1.0),
+        reading(eid("b3"), "beta", beta_seq + 2, 1000, 1.0),
+        reading(eid("b4"), "beta", beta_seq + 3, 1000, 1.0),
+    ):
+        f_status, _, _ = req("POST", "/readings", follow)
+        accepted = accepted and f_status == 200
+    check(accepted, "follow-up readings after the rejection are accepted")
+
+    expected_wm = iso(base_ms + 1_000_000 - lateness_ms)
+    status, _, state = req("GET", "/state")
+    check(
+        status == 200
+        and state["probes"]["alpha"]["contiguous_seq"] == alpha_seq + 5
+        and state["probes"]["alpha"]["max_seq"] == alpha_seq + 5
+        and state.get("watermark") == expected_wm,
+        "probe progress and watermark recover past the disposed seq",
+        context=f"got {state}",
+    )
+    _, _, w1 = req("GET", f"/windows/{iso(base_ms + 300_000)}")
+    check(
+        w1.get("status") == "sealed"
+        and w1.get("total_dose") == 10.0
+        and w1.get("event_count") == 2,
+        "next window seals without the rejected dose",
+        context=f"got {w1}",
+    )
+    _, _, window_w0 = req("GET", f"/windows/{w0_start}")
+    check(
+        window_w0.get("total_dose") == 45.0 and window_w0.get("event_count") == 3,
+        "sealed summary still excludes the rejected reading",
+    )
+
     # -- 3. recovery --------------------------------------------------------
     saved_window = window_after
     saved_ack = ack1
@@ -249,10 +302,11 @@ def main() -> int:
             "sealed window still rejects late data after restart",
         )
         status, _, state = req("GET", "/state")
-        expected_wm = iso(base_ms + 370_000 - lateness_ms)
         check(
-            status == 200 and state.get("watermark") == expected_wm,
-            "watermark recovered from persistent state",
+            status == 200
+            and state.get("watermark") == expected_wm
+            and state["probes"]["alpha"]["contiguous_seq"] == alpha_seq + 5,
+            "watermark and probe progress recovered from persistent state",
             context=f"got {state.get('watermark')}, want {expected_wm}",
         )
 
